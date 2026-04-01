@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,17 +23,7 @@ type RawBus struct {
 	Linha      string `json:"linha"`
 }
 
-type Bus struct {
-	ID    string  `json:"ordem"`
-	Lat   float64 `json:"latitude"`
-	Long  float64 `json:"longitude"`
-	Time  string  `json:"datahora"`
-	Speed float64 `json:"velocidade"`
-	Line  string  `json:"linha"`
-}
-
 var (
-	// Cacheamos os bytes JSON prontos em vez de []Bus — evita re-encoding por request
 	cachedJSON []byte
 	cacheLock  sync.RWMutex
 )
@@ -43,10 +34,10 @@ func parseBR(s string) float64 {
 	return f
 }
 
+// fetchSPPO usa streaming JSON: lê 1 objeto por vez, transforma e escreve
+// direto num buffer. Nunca segura 488k structs na memória.
 func fetchSPPO() ([]byte, error) {
 	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
-
-	// Client sem timeout global — usamos só timeout de conexão
 	client := &http.Client{Timeout: 90 * time.Second}
 
 	resp, err := client.Get(url)
@@ -56,47 +47,61 @@ func fetchSPPO() ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, resp.Body)
 		return nil, fmt.Errorf("status: %d", resp.StatusCode)
 	}
 
-	// Lê todo o body de uma vez (evita timeout durante streaming decode)
-	body, err := io.ReadAll(resp.Body)
+	decoder := json.NewDecoder(resp.Body)
+
+	// Lê o '[' inicial do array
+	t, err := decoder.Token()
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("token: %w", err)
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '[' {
+		return nil, fmt.Errorf("expected '[', got %v", t)
 	}
 
-	// Decodifica pra filtrar dados inválidos
-	var raw []RawBus
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
-	}
+	// Buffer onde montamos o JSON de saída
+	var buf bytes.Buffer
+	buf.WriteByte('[')
 
-	// Filtra e converte
-	buses := make([]Bus, 0, len(raw))
-	for _, rb := range raw {
-		if rb.Ordem != "" && rb.Latitude != "" && rb.Longitude != "" {
-			buses = append(buses, Bus{
-				ID:    rb.Ordem,
-				Lat:   parseBR(rb.Latitude),
-				Long:  parseBR(rb.Longitude),
-				Time:  rb.DataHora,
-				Speed: parseBR(rb.Velocidade),
-				Line:  rb.Linha,
-			})
+	first := true
+	count := 0
+
+	// Processa um objeto por vez — memória constante
+	for decoder.More() {
+		var rb RawBus
+		if err := decoder.Decode(&rb); err != nil {
+			continue // Pula registros malformados
 		}
+
+		if rb.Ordem == "" || rb.Latitude == "" || rb.Longitude == "" {
+			continue
+		}
+
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+
+		// Escreve o JSON transformado direto no buffer
+		fmt.Fprintf(&buf,
+			`{"ordem":"%s","latitude":%s,"longitude":%s,"datahora":"%s","velocidade":%s,"linha":"%s"}`,
+			rb.Ordem,
+			strings.ReplaceAll(rb.Latitude, ",", "."),
+			strings.ReplaceAll(rb.Longitude, ",", "."),
+			rb.DataHora,
+			strings.ReplaceAll(rb.Velocidade, ",", "."),
+			rb.Linha,
+		)
+		count++
 	}
 
-	// Serializa uma vez — esse []byte é o que servimos nos requests
-	result, err := json.Marshal(buses)
-	if err != nil {
-		return nil, fmt.Errorf("marshal: %w", err)
-	}
+	buf.WriteByte(']')
 
-	// Libera memória dos slices intermediários
-	raw = nil
-	buses = nil
-
-	return result, nil
+	log.Printf("Processados %d onibus, %d bytes", count, buf.Len())
+	return buf.Bytes(), nil
 }
 
 func cacheUpdater() {
@@ -108,7 +113,7 @@ func cacheUpdater() {
 			cacheLock.Lock()
 			cachedJSON = data
 			cacheLock.Unlock()
-			log.Printf("Cache OK: %d bytes", len(data))
+			log.Printf("Cache atualizado: %d bytes", len(data))
 		}
 		time.Sleep(10 * time.Second)
 	}
@@ -137,7 +142,6 @@ func main() {
 		data := cachedJSON
 		cacheLock.RUnlock()
 
-		// Escreve os bytes JSON direto — sem encoding, sem alocação
 		w.Write(data)
 	})
 
