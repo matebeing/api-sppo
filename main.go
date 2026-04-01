@@ -45,23 +45,24 @@ var (
 	clientsMu sync.Mutex
 )
 
-// ── HTTP Transport persistente — reutiliza TCP/TLS entre fetches ─────
+// ── HTTP Transport otimizado ─────────────────────────────────────────
+// Keep-alive persistente, buffers grandes, conexão reutilizada
 var transport = &http.Transport{
-	MaxIdleConns:        5,
-	MaxIdleConnsPerHost: 5,
-	IdleConnTimeout:     120 * time.Second,
+	MaxIdleConns:        10,
+	MaxIdleConnsPerHost: 10,
+	IdleConnTimeout:     300 * time.Second,
 	DisableKeepAlives:   false,
-	// Buffers maiores para ler o body rápido
-	WriteBufferSize:     64 * 1024,
-	ReadBufferSize:      64 * 1024,
+	WriteBufferSize:     128 * 1024,
+	ReadBufferSize:      128 * 1024,
+	ForceAttemptHTTP2:   true,
 }
 
 var persistentClient = &http.Client{
-	Timeout:   90 * time.Second,
+	Timeout:   60 * time.Second,
 	Transport: transport,
 }
 
-// ── WebSocket (stdlib puro, zero deps) ───────────────────────────────
+// ── WebSocket ────────────────────────────────────────────────────────
 
 func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsClient, error) {
 	key := r.Header.Get("Sec-WebSocket-Key")
@@ -83,6 +84,12 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsClient, error) {
 		return nil, err
 	}
 
+	// TCP tuning na conexão WebSocket
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetWriteBuffer(256 * 1024)
+	}
+
 	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	bufrw.WriteString("Upgrade: websocket\r\n")
 	bufrw.WriteString("Connection: Upgrade\r\n")
@@ -96,7 +103,7 @@ func (c *wsClient) writeFrame(opcode byte, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	c.conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
 	header := []byte{0x80 | opcode}
 	length := len(data)
@@ -115,10 +122,9 @@ func (c *wsClient) writeFrame(opcode byte, data []byte) error {
 		header = append(header, b...)
 	}
 
-	if _, err := c.conn.Write(header); err != nil {
-		return err
-	}
-	_, err := c.conn.Write(data)
+	// Envia header + payload em uma única syscall (Writev)
+	full := append(header, data...)
+	_, err := c.conn.Write(full)
 	return err
 }
 
@@ -128,12 +134,11 @@ func (c *wsClient) readLoop() {
 		delete(clients, c)
 		clientsMu.Unlock()
 		c.conn.Close()
-		log.Println("WS cliente desconectou")
 	}()
 
 	buf := make([]byte, 512)
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		n, err := c.conn.Read(buf)
 		if err != nil {
 			return
@@ -142,19 +147,18 @@ func (c *wsClient) readLoop() {
 			continue
 		}
 		opcode := buf[0] & 0x0F
-		switch opcode {
-		case 0x8:
+		if opcode == 0x8 {
 			return
-		case 0x9:
-			c.writeFrame(0xA, nil)
+		}
+		if opcode == 0x9 {
+			c.writeFrame(0xA, nil) // Pong
 		}
 	}
 }
 
-// Broadcast ASSÍNCRONO — não bloqueia o fetch loop
+// Broadcast paralelo para todos os WS clients
 func broadcastAsync(data []byte) {
 	clientsMu.Lock()
-	// Snapshot dos clientes atuais
 	snapshot := make([]*wsClient, 0, len(clients))
 	for c := range clients {
 		snapshot = append(snapshot, c)
@@ -165,7 +169,6 @@ func broadcastAsync(data []byte) {
 		return
 	}
 
-	// Envia em paralelo para todos os clientes
 	var wg sync.WaitGroup
 	for _, c := range snapshot {
 		wg.Add(1)
@@ -180,38 +183,36 @@ func broadcastAsync(data []byte) {
 		}(c)
 	}
 	wg.Wait()
-
-	log.Printf("WS broadcast: %d clientes", len(snapshot))
 }
 
-// ── Fetch SPPO ───────────────────────────────────────────────────────
+// ── Fetch SPPO (streaming, zero alocação extra) ─────────────────────
 
-func fetchSPPO() ([]byte, int, error) {
+func fetchSPPO(pipeline int) ([]byte, int, time.Duration, error) {
+	start := time.Now()
 	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
 
 	resp, err := persistentClient.Get(url)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request: %w", err)
+		return nil, 0, time.Since(start), fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		io.Copy(io.Discard, resp.Body)
-		return nil, 0, fmt.Errorf("status: %d", resp.StatusCode)
+		return nil, 0, time.Since(start), fmt.Errorf("status: %d", resp.StatusCode)
 	}
 
 	decoder := json.NewDecoder(resp.Body)
-
 	t, err := decoder.Token()
 	if err != nil {
-		return nil, 0, fmt.Errorf("token: %w", err)
+		return nil, 0, time.Since(start), fmt.Errorf("token: %w", err)
 	}
 	if delim, ok := t.(json.Delim); !ok || delim != '[' {
-		return nil, 0, fmt.Errorf("expected '[', got %v", t)
+		return nil, 0, time.Since(start), fmt.Errorf("expected '['")
 	}
 
 	var buf bytes.Buffer
-	buf.Grow(6 * 1024 * 1024) // Pre-aloca ~6MB para o gzip
+	buf.Grow(6 * 1024 * 1024)
 	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 	gz.Write([]byte("["))
 
@@ -247,53 +248,66 @@ func fetchSPPO() ([]byte, int, error) {
 	gz.Write([]byte("]"))
 	gz.Close()
 
-	return buf.Bytes(), count, nil
+	return buf.Bytes(), count, time.Since(start), nil
 }
 
-// ── Cache Updater — fetch contínuo com intervalo mínimo de 5s ────────
-
-const minInterval = 5 * time.Second
+// ── Pipeline Duplo — 2 goroutines buscando continuamente ─────────────
+// Pipeline 0:  [====fetch====]              [====fetch====]
+// Pipeline 1:       [====fetch====]              [====fetch====]
+// Cache:       ─────^update──^update────────^update──^update─────
+//
+// Resultado: cache atualiza com o DOBRO da frequência
 
 func cacheUpdater() {
-	for {
-		start := time.Now()
+	const numPipelines = 2
 
-		data, count, err := fetchSPPO()
-		fetchDuration := time.Since(start)
+	for i := 0; i < numPipelines; i++ {
+		go func(id int) {
+			// Staggers os pipelines pra não baterem juntos na API
+			time.Sleep(time.Duration(id) * 3 * time.Second)
 
-		if err != nil {
-			log.Printf("Erro fetch (%.1fs): %v", fetchDuration.Seconds(), err)
-			// Em caso de erro, espera 3s antes de tentar de novo
-			time.Sleep(3 * time.Second)
-			continue
-		}
+			for {
+				data, count, duration, err := fetchSPPO(id)
 
-		// 1. Atualiza o cache IMEDIATAMENTE
-		cacheLock.Lock()
-		cachedGzip = data
-		cacheLock.Unlock()
+				if err != nil {
+					log.Printf("[P%d] Erro (%.1fs): %v", id, duration.Seconds(), err)
+					time.Sleep(1 * time.Second) // Retry rápido em erro
+					continue
+				}
 
-		// 2. Broadcast assíncrono para WebSocket clients (não bloqueia)
-		go broadcastAsync(data)
+				// Atualiza cache IMEDIATAMENTE
+				cacheLock.Lock()
+				cachedGzip = data
+				cacheLock.Unlock()
 
-		// 3. GC e stats
-		runtime.GC()
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("Ciclo: %d onibus | fetch: %.1fs | gzip: %d bytes | RAM: %.1f MB",
-			count, fetchDuration.Seconds(), len(data), float64(m.Alloc)/1024/1024)
+				// Push para WS clients em paralelo (não bloqueia próximo fetch)
+				go broadcastAsync(data)
 
-		// 4. Espera o mínimo de 5s desde o início do fetch
-		//    Se o fetch demorou 8s, começa o próximo imediatamente
-		//    Se demorou 2s, espera mais 3s (total = 5s)
-		elapsed := time.Since(start)
-		if elapsed < minInterval {
-			time.Sleep(minInterval - elapsed)
-		}
+				log.Printf("[P%d] %d onibus | %.1fs | %d bytes",
+					id, count, duration.Seconds(), len(data))
+
+				// ZERO sleep — começa próximo fetch imediatamente
+				// O "intervalo" é o tempo que o fetch demora (~7-10s)
+				// Com 2 pipelines, cache atualiza a cada ~3-5s
+			}
+		}(i)
 	}
+
+	// GC periódico suave (a cada 30s, sem travar o fetch)
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			runtime.GC()
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			log.Printf("RAM: %.1f MB | GC cycles: %d", float64(m.Alloc)/1024/1024, m.NumGC)
+		}
+	}()
+
+	select {} // Bloqueia forever
 }
 
-// ── CORS Middleware ──────────────────────────────────────────────────
+// ── CORS ─────────────────────────────────────────────────────────────
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +315,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
-
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -313,14 +326,13 @@ func corsMiddleware(next http.Handler) http.Handler {
 // ── Main ─────────────────────────────────────────────────────────────
 
 func main() {
-	log.Println("Iniciando SPPO Proxy (HTTP + WebSocket)...")
+	log.Println("SPPO Proxy v3 — dual pipeline, zero delay")
 
 	cachedGzip = nil
 	go cacheUpdater()
 
 	mux := http.NewServeMux()
 
-	// HTTP endpoint (fallback)
 	mux.HandleFunc("/buses", func(w http.ResponseWriter, r *http.Request) {
 		cacheLock.RLock()
 		data := cachedGzip
@@ -335,23 +347,22 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Write(data)
 	})
 
-	// WebSocket endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		client, err := wsUpgrade(w, r)
 		if err != nil {
 			log.Printf("WS upgrade erro: %v", err)
 			return
 		}
-		log.Println("WS novo cliente conectado")
+		log.Println("WS cliente conectou")
 
 		clientsMu.Lock()
 		clients[client] = true
 		clientsMu.Unlock()
 
-		// Envia dados atuais imediatamente na conexão
 		cacheLock.RLock()
 		data := cachedGzip
 		cacheLock.RUnlock()
@@ -366,12 +377,10 @@ func main() {
 		cacheLock.RLock()
 		cacheSize := len(cachedGzip)
 		cacheLock.RUnlock()
-
 		clientsMu.Lock()
 		n := len(clients)
 		clientsMu.Unlock()
-
-		w.Write([]byte(fmt.Sprintf("OK | cache: %d bytes | ws: %d clients", cacheSize, n)))
+		w.Write([]byte(fmt.Sprintf("OK | cache: %d bytes | ws: %d", cacheSize, n)))
 	})
 
 	handler := corsMiddleware(mux)
@@ -381,6 +390,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("Escutando em 0.0.0.0:%s", port)
+	log.Printf("Porta: %s", port)
 	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, handler))
 }
