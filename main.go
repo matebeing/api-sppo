@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,11 +32,9 @@ type Bus struct {
 }
 
 var (
-	cache     []Bus
-	cacheLock sync.RWMutex
-	httpClient = &http.Client{
-		Timeout: 15 * time.Second,
-	}
+	// Cacheamos os bytes JSON prontos em vez de []Bus — evita re-encoding por request
+	cachedJSON []byte
+	cacheLock  sync.RWMutex
 )
 
 func parseBR(s string) float64 {
@@ -44,24 +43,35 @@ func parseBR(s string) float64 {
 	return f
 }
 
-func fetchSPPO() ([]Bus, error) {
+func fetchSPPO() ([]byte, error) {
 	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
 
-	resp, err := httpClient.Get(url)
+	// Client sem timeout global — usamos só timeout de conexão
+	client := &http.Client{Timeout: 90 * time.Second}
+
+	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("status: %d", resp.StatusCode)
 	}
 
+	// Lê todo o body de uma vez (evita timeout durante streaming decode)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	// Decodifica pra filtrar dados inválidos
 	var raw []RawBus
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("json decode: %w", err)
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
 
+	// Filtra e converte
 	buses := make([]Bus, 0, len(raw))
 	for _, rb := range raw {
 		if rb.Ordem != "" && rb.Latitude != "" && rb.Longitude != "" {
@@ -76,7 +86,17 @@ func fetchSPPO() ([]Bus, error) {
 		}
 	}
 
-	return buses, nil
+	// Serializa uma vez — esse []byte é o que servimos nos requests
+	result, err := json.Marshal(buses)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+
+	// Libera memória dos slices intermediários
+	raw = nil
+	buses = nil
+
+	return result, nil
 }
 
 func cacheUpdater() {
@@ -86,18 +106,18 @@ func cacheUpdater() {
 			log.Printf("Erro fetch: %v", err)
 		} else {
 			cacheLock.Lock()
-			cache = data
+			cachedJSON = data
 			cacheLock.Unlock()
-			log.Printf("Cache: %d onibus", len(data))
+			log.Printf("Cache OK: %d bytes", len(data))
 		}
-		time.Sleep(7 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 }
 
 func main() {
 	log.Println("Iniciando SPPO Proxy...")
 
-	cache = []Bus{}
+	cachedJSON = []byte("[]")
 	go cacheUpdater()
 
 	mux := http.NewServeMux()
@@ -114,14 +134,14 @@ func main() {
 		}
 
 		cacheLock.RLock()
-		data := cache
+		data := cachedJSON
 		cacheLock.RUnlock()
 
-		json.NewEncoder(w).Encode(data)
+		// Escreve os bytes JSON direto — sem encoding, sem alocação
+		w.Write(data)
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
 
