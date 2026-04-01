@@ -3,25 +3,32 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Copia os arquivos de módulo e baixa as dependências
+# Instala certificados de CA para permitir que o go mod baixe dependências
+RUN apk --no-cache add ca-certificates git
+
+# Copia os arquivos de módulo
 COPY go.mod ./
 RUN go mod download
 
 # Copia o código fonte
 COPY . .
 
-# Compila o binário estático
-RUN CGO_ENABLED=0 GOOS=linux go build -o /api-sppo-proxy main.go
+# Limpa e garante que as dependências estejam corretas
+RUN go mod tidy
 
-# Estágio Final (mínimo)
+# Compila o binário estático no diretório atual
+RUN CGO_ENABLED=0 GOOS=linux go build -o api-sppo-proxy .
+
+# Estágio Final
 FROM alpine:latest
 
 WORKDIR /
 
-# Instala certificados CA (necessários para chamadas HTTPS para a SPPO)
+# Reinstala certificados no estágio final para chamadas HTTPS
 RUN apk --no-cache add ca-certificates
 
-COPY --from=builder /api-sppo-proxy /api-sppo-proxy
+# Copia o binário gerado na etapa anterior
+COPY --from=builder /app/api-sppo-proxy /api-sppo-proxy
 
 # Porta padrão do Render
 EXPOSE 8080
