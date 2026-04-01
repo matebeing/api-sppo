@@ -4,19 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/valyala/fasthttp"
 )
 
-// RawBus is the format from the SPPO API
 type RawBus struct {
 	Ordem      string `json:"ordem"`
 	Latitude   string `json:"latitude"`
@@ -26,7 +21,6 @@ type RawBus struct {
 	Linha      string `json:"linha"`
 }
 
-// Bus is the filtered/optimized format for the PWA
 type Bus struct {
 	ID    string  `json:"ordem"`
 	Lat   float64 `json:"latitude"`
@@ -39,9 +33,8 @@ type Bus struct {
 var (
 	cache     []Bus
 	cacheLock sync.RWMutex
-	client    = &fasthttp.Client{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+	httpClient = &http.Client{
+		Timeout: 15 * time.Second,
 	}
 )
 
@@ -52,33 +45,25 @@ func parseBR(s string) float64 {
 }
 
 func fetchSPPO() ([]Bus, error) {
-	url := "https://dados.mobilidade.rio/gps/sppo"
-	req := fasthttp.AcquireRequest()
-	res := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(res)
+	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
 
-	req.SetRequestURI(url)
-	req.Header.SetMethod("GET")
-	// Evita cache da prefeitura
-	req.SetRequestURI(fmt.Sprintf("%s?_t=%d", url, time.Now().UnixNano()))
-
-	if err := client.Do(req, res); err != nil {
-		return nil, err
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
+	defer resp.Body.Close()
 
-	if res.StatusCode() != 200 {
-		return nil, fmt.Errorf("status code error: %d", res.StatusCode())
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status code: %d", resp.StatusCode)
 	}
 
 	var raw []RawBus
-	if err := json.Unmarshal(res.Body(), &raw); err != nil {
-		return nil, err
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("json decode: %w", err)
 	}
 
 	buses := make([]Bus, 0, len(raw))
 	for _, rb := range raw {
-		// Só adiciona se tiver o mínimo necessário
 		if rb.Ordem != "" && rb.Latitude != "" && rb.Longitude != "" {
 			buses = append(buses, Bus{
 				ID:    rb.Ordem,
@@ -95,51 +80,49 @@ func fetchSPPO() ([]Bus, error) {
 }
 
 func cacheUpdater() {
-	// Loop de 7 segundos para bater o intervalo de 5-10 solicitado
-	ticker := time.NewTicker(7 * time.Second)
-	for range ticker.C {
+	for {
 		data, err := fetchSPPO()
 		if err != nil {
-			log.Printf("Erro ao buscar SPPO: %v", err)
-			continue
+			log.Printf("Erro fetch: %v", err)
+		} else {
+			cacheLock.Lock()
+			cache = data
+			cacheLock.Unlock()
+			log.Printf("Cache: %d onibus", len(data))
 		}
-
-		cacheLock.Lock()
-		cache = data
-		cacheLock.Unlock()
-		log.Printf("Cache atualizado: %d ônibus", len(data))
+		time.Sleep(7 * time.Second)
 	}
 }
 
 func main() {
-	app := fiber.New(fiber.Config{
-		AppName: "SPPO Proxy RioNoPonto",
-	})
+	log.Println("Iniciando SPPO Proxy...")
 
-	app.Use(logger.New())
-	app.Use(cors.New())
-
-	// Inicializa o primeiro fetch
-	initial, err := fetchSPPO()
-	if err == nil {
-		cache = initial
-	} else {
-		log.Printf("Erro no fetch inicial: %v", err)
-	}
-
-	// Inicia o atualizador de cache em background
+	cache = []Bus{}
 	go cacheUpdater()
 
-	app.Get("/buses", func(c *fiber.Ctx) error {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/buses", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		cacheLock.RLock()
 		data := cache
 		cacheLock.RUnlock()
 
-		return c.JSON(data)
+		json.NewEncoder(w).Encode(data)
 	})
 
-	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.SendString("OK")
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 	})
 
 	port := os.Getenv("PORT")
@@ -147,5 +130,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Fatal(app.Listen(":" + port))
+	log.Printf("Escutando em 0.0.0.0:%s", port)
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, mux))
 }
