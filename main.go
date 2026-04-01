@@ -46,12 +46,20 @@ var (
 	clientsMu sync.Mutex
 )
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// ── HTTP Transport persistente — reutiliza TCP/TLS entre fetches ─────
+var transport = &http.Transport{
+	MaxIdleConns:        5,
+	MaxIdleConnsPerHost: 5,
+	IdleConnTimeout:     120 * time.Second,
+	DisableKeepAlives:   false,
+	// Buffers maiores para ler o body rápido
+	WriteBufferSize:     64 * 1024,
+	ReadBufferSize:      64 * 1024,
+}
 
-func parseBR(s string) float64 {
-	s = strings.ReplaceAll(s, ",", ".")
-	f, _ := strconv.ParseFloat(s, 64)
-	return f
+var persistentClient = &http.Client{
+	Timeout:   90 * time.Second,
+	Transport: transport,
 }
 
 // ── WebSocket (stdlib puro, zero deps) ───────────────────────────────
@@ -63,12 +71,10 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsClient, error) {
 		return nil, fmt.Errorf("missing key")
 	}
 
-	// Calcula o accept key conforme RFC 6455
 	h := sha1.New()
 	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-5AB9DC11D85A"))
 	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	// Hijack: toma controle da conexão TCP
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return nil, fmt.Errorf("hijack not supported")
@@ -78,7 +84,6 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsClient, error) {
 		return nil, err
 	}
 
-	// Envia resposta de upgrade
 	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	bufrw.WriteString("Upgrade: websocket\r\n")
 	bufrw.WriteString("Connection: Upgrade\r\n")
@@ -88,16 +93,13 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsClient, error) {
 	return &wsClient{conn: conn}, nil
 }
 
-// Escreve um frame WebSocket (server→client, sem mask)
 func (c *wsClient) writeFrame(opcode byte, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
-	// Header: FIN=1 + opcode
 	header := []byte{0x80 | opcode}
-
 	length := len(data)
 	switch {
 	case length < 126:
@@ -121,7 +123,6 @@ func (c *wsClient) writeFrame(opcode byte, data []byte) error {
 	return err
 }
 
-// Loop de leitura — detecta desconexão e responde pings
 func (c *wsClient) readLoop() {
 	defer func() {
 		clientsMu.Lock()
@@ -141,62 +142,77 @@ func (c *wsClient) readLoop() {
 		if n < 2 {
 			continue
 		}
-
 		opcode := buf[0] & 0x0F
-
 		switch opcode {
-		case 0x8: // Close
+		case 0x8:
 			return
-		case 0x9: // Ping → responde Pong
+		case 0x9:
 			c.writeFrame(0xA, nil)
 		}
 	}
 }
 
-// Envia dados gzip para todos os clientes conectados
-func broadcast(data []byte) {
+// Broadcast ASSÍNCRONO — não bloqueia o fetch loop
+func broadcastAsync(data []byte) {
 	clientsMu.Lock()
-	defer clientsMu.Unlock()
-
+	// Snapshot dos clientes atuais
+	snapshot := make([]*wsClient, 0, len(clients))
 	for c := range clients {
-		if err := c.writeFrame(0x2, data); err != nil { // 0x2 = binary frame
-			c.conn.Close()
-			delete(clients, c)
-			log.Println("WS cliente removido (write error)")
-		}
+		snapshot = append(snapshot, c)
+	}
+	clientsMu.Unlock()
+
+	if len(snapshot) == 0 {
+		return
 	}
 
-	log.Printf("WS broadcast: %d clientes", len(clients))
+	// Envia em paralelo para todos os clientes
+	var wg sync.WaitGroup
+	for _, c := range snapshot {
+		wg.Add(1)
+		go func(client *wsClient) {
+			defer wg.Done()
+			if err := client.writeFrame(0x2, data); err != nil {
+				clientsMu.Lock()
+				delete(clients, client)
+				clientsMu.Unlock()
+				client.conn.Close()
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	log.Printf("WS broadcast: %d clientes", len(snapshot))
 }
 
 // ── Fetch SPPO ───────────────────────────────────────────────────────
 
-func fetchSPPO() ([]byte, error) {
+func fetchSPPO() ([]byte, int, error) {
 	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
-	client := &http.Client{Timeout: 90 * time.Second}
 
-	resp, err := client.Get(url)
+	resp, err := persistentClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("request: %w", err)
+		return nil, 0, fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("status: %d", resp.StatusCode)
+		return nil, 0, fmt.Errorf("status: %d", resp.StatusCode)
 	}
 
 	decoder := json.NewDecoder(resp.Body)
 
 	t, err := decoder.Token()
 	if err != nil {
-		return nil, fmt.Errorf("token: %w", err)
+		return nil, 0, fmt.Errorf("token: %w", err)
 	}
 	if delim, ok := t.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("expected '[', got %v", t)
+		return nil, 0, fmt.Errorf("expected '[', got %v", t)
 	}
 
 	var buf bytes.Buffer
+	buf.Grow(6 * 1024 * 1024) // Pre-aloca ~6MB para o gzip
 	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 	gz.Write([]byte("["))
 
@@ -217,7 +233,7 @@ func fetchSPPO() ([]byte, error) {
 		}
 		first = false
 
-		entry := fmt.Sprintf(
+		fmt.Fprintf(gz,
 			`{"ordem":"%s","latitude":%s,"longitude":%s,"datahora":"%s","velocidade":%s,"linha":"%s"}`,
 			rb.Ordem,
 			strings.ReplaceAll(rb.Latitude, ",", "."),
@@ -226,38 +242,55 @@ func fetchSPPO() ([]byte, error) {
 			strings.ReplaceAll(rb.Velocidade, ",", "."),
 			rb.Linha,
 		)
-		gz.Write([]byte(entry))
 		count++
 	}
 
 	gz.Write([]byte("]"))
 	gz.Close()
 
-	log.Printf("Fetch: %d onibus, gzip: %d bytes", count, buf.Len())
-	return buf.Bytes(), nil
+	return buf.Bytes(), count, nil
 }
 
-// ── Cache Updater ────────────────────────────────────────────────────
+// ── Cache Updater — fetch contínuo com intervalo mínimo de 5s ────────
+
+const minInterval = 5 * time.Second
 
 func cacheUpdater() {
 	for {
-		data, err := fetchSPPO()
+		start := time.Now()
+
+		data, count, err := fetchSPPO()
+		fetchDuration := time.Since(start)
+
 		if err != nil {
-			log.Printf("Erro fetch: %v", err)
-		} else {
-			cacheLock.Lock()
-			cachedGzip = data
-			cacheLock.Unlock()
-
-			// Broadcast para todos os WebSocket clients
-			broadcast(data)
-
-			runtime.GC()
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			log.Printf("Cache OK: %d bytes | RAM: %.1f MB", len(data), float64(m.Alloc)/1024/1024)
+			log.Printf("Erro fetch (%.1fs): %v", fetchDuration.Seconds(), err)
+			// Em caso de erro, espera 3s antes de tentar de novo
+			time.Sleep(3 * time.Second)
+			continue
 		}
-		time.Sleep(10 * time.Second)
+
+		// 1. Atualiza o cache IMEDIATAMENTE
+		cacheLock.Lock()
+		cachedGzip = data
+		cacheLock.Unlock()
+
+		// 2. Broadcast assíncrono para WebSocket clients (não bloqueia)
+		go broadcastAsync(data)
+
+		// 3. GC e stats
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		log.Printf("Ciclo: %d onibus | fetch: %.1fs | gzip: %d bytes | RAM: %.1f MB",
+			count, fetchDuration.Seconds(), len(data), float64(m.Alloc)/1024/1024)
+
+		// 4. Espera o mínimo de 5s desde o início do fetch
+		//    Se o fetch demorou 8s, começa o próximo imediatamente
+		//    Se demorou 2s, espera mais 3s (total = 5s)
+		elapsed := time.Since(start)
+		if elapsed < minInterval {
+			time.Sleep(minInterval - elapsed)
+		}
 	}
 }
 
@@ -288,7 +321,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// HTTP endpoint (fallback / compatibilidade)
+	// HTTP endpoint (fallback)
 	mux.HandleFunc("/buses", func(w http.ResponseWriter, r *http.Request) {
 		cacheLock.RLock()
 		data := cachedGzip
@@ -315,29 +348,31 @@ func main() {
 		}
 		log.Println("WS novo cliente conectado")
 
-		// Registra o cliente
 		clientsMu.Lock()
 		clients[client] = true
 		clientsMu.Unlock()
 
-		// Envia dados atuais imediatamente
+		// Envia dados atuais imediatamente na conexão
 		cacheLock.RLock()
 		data := cachedGzip
 		cacheLock.RUnlock()
-
 		if data != nil {
-			client.writeFrame(0x2, data) // binary frame
+			client.writeFrame(0x2, data)
 		}
 
-		// Bloqueia nessa goroutine lendo do cliente (detecta desconexão)
 		client.readLoop()
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		cacheLock.RLock()
+		cacheSize := len(cachedGzip)
+		cacheLock.RUnlock()
+
 		clientsMu.Lock()
 		n := len(clients)
 		clientsMu.Unlock()
-		w.Write([]byte(fmt.Sprintf("OK | %d ws clients", n)))
+
+		w.Write([]byte(fmt.Sprintf("OK | cache: %d bytes | ws: %d clients", cacheSize, n)))
 	})
 
 	handler := corsMiddleware(mux)
