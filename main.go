@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +26,7 @@ type RawBus struct {
 }
 
 var (
-	cachedJSON []byte
+	cachedGzip []byte
 	cacheLock  sync.RWMutex
 )
 
@@ -34,8 +36,6 @@ func parseBR(s string) float64 {
 	return f
 }
 
-// fetchSPPO usa streaming JSON: lê 1 objeto por vez, transforma e escreve
-// direto num buffer. Nunca segura 488k structs na memória.
 func fetchSPPO() ([]byte, error) {
 	url := fmt.Sprintf("https://dados.mobilidade.rio/gps/sppo?_t=%d", time.Now().UnixNano())
 	client := &http.Client{Timeout: 90 * time.Second}
@@ -53,7 +53,6 @@ func fetchSPPO() ([]byte, error) {
 
 	decoder := json.NewDecoder(resp.Body)
 
-	// Lê o '[' inicial do array
 	t, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("token: %w", err)
@@ -62,18 +61,18 @@ func fetchSPPO() ([]byte, error) {
 		return nil, fmt.Errorf("expected '[', got %v", t)
 	}
 
-	// Buffer onde montamos o JSON de saída
+	// Escreve direto num gzip writer → buffer comprimido
 	var buf bytes.Buffer
-	buf.WriteByte('[')
+	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	gz.Write([]byte("["))
 
 	first := true
 	count := 0
 
-	// Processa um objeto por vez — memória constante
 	for decoder.More() {
 		var rb RawBus
 		if err := decoder.Decode(&rb); err != nil {
-			continue // Pula registros malformados
+			continue
 		}
 
 		if rb.Ordem == "" || rb.Latitude == "" || rb.Longitude == "" {
@@ -81,12 +80,11 @@ func fetchSPPO() ([]byte, error) {
 		}
 
 		if !first {
-			buf.WriteByte(',')
+			gz.Write([]byte(","))
 		}
 		first = false
 
-		// Escreve o JSON transformado direto no buffer
-		fmt.Fprintf(&buf,
+		entry := fmt.Sprintf(
 			`{"ordem":"%s","latitude":%s,"longitude":%s,"datahora":"%s","velocidade":%s,"linha":"%s"}`,
 			rb.Ordem,
 			strings.ReplaceAll(rb.Latitude, ",", "."),
@@ -95,12 +93,14 @@ func fetchSPPO() ([]byte, error) {
 			strings.ReplaceAll(rb.Velocidade, ",", "."),
 			rb.Linha,
 		)
+		gz.Write([]byte(entry))
 		count++
 	}
 
-	buf.WriteByte(']')
+	gz.Write([]byte("]"))
+	gz.Close()
 
-	log.Printf("Processados %d onibus, %d bytes", count, buf.Len())
+	log.Printf("Fetch: %d onibus, gzip: %d bytes", count, buf.Len())
 	return buf.Bytes(), nil
 }
 
@@ -111,37 +111,58 @@ func cacheUpdater() {
 			log.Printf("Erro fetch: %v", err)
 		} else {
 			cacheLock.Lock()
-			cachedJSON = data
+			cachedGzip = data
 			cacheLock.Unlock()
-			log.Printf("Cache atualizado: %d bytes", len(data))
+
+			// Força GC após trocar o cache pra liberar memória
+			runtime.GC()
+
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			log.Printf("Cache OK: %d bytes gzip | RAM: %.1f MB", len(data), float64(m.Alloc)/1024/1024)
 		}
 		time.Sleep(10 * time.Second)
 	}
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	log.Println("Iniciando SPPO Proxy...")
 
-	cachedJSON = []byte("[]")
+	cachedGzip = nil
 	go cacheUpdater()
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/buses", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		cacheLock.RLock()
+		data := cachedGzip
+		cacheLock.RUnlock()
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+		if data == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("[]"))
 			return
 		}
 
-		cacheLock.RLock()
-		data := cachedJSON
-		cacheLock.RUnlock()
-
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Vary", "Accept-Encoding")
 		w.Write(data)
 	})
 
@@ -149,11 +170,13 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
+	handler := corsMiddleware(mux)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
 	log.Printf("Escutando em 0.0.0.0:%s", port)
-	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, mux))
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, handler))
 }
